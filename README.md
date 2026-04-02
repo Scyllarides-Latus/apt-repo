@@ -60,18 +60,36 @@ gpg --armor --export-secret-keys "Scyllarides-Latus APT Repository"
 
 ## Setup: Source project integration
 
-Each source project needs a GitHub Actions step like:
+Authentication uses a GitHub App (`Scyllarides-Latus APT Publisher`) owned by the org. This provides short-lived, scoped tokens instead of long-lived PATs.
+
+Each source project needs two secrets:
+
+| Secret | Value |
+|--------|-------|
+| `APT_APP_ID` | The App's numeric ID (from the App settings page) |
+| `APT_APP_PRIVATE_KEY` | The App's private key (`.pem` file contents) |
+
+Then add these steps to the release workflow:
 
 ```yaml
+- name: Generate APT repo token
+  id: app-token
+  uses: actions/create-github-app-token@v1
+  with:
+    app-id: ${{ secrets.APT_APP_ID }}
+    private-key: ${{ secrets.APT_APP_PRIVATE_KEY }}
+    owner: Scyllarides-Latus
+    repositories: apt-repo
+
 - name: Notify APT repo
   env:
-    APT_REPO_PAT: ${{ secrets.APT_REPO_PAT }}
+    GH_TOKEN: ${{ steps.app-token.outputs.token }}
+    TAG: ${{ github.ref_name }}
   run: |
-    curl -X POST \
-      -H "Authorization: token ${APT_REPO_PAT}" \
-      -H "Accept: application/vnd.github.v3+json" \
-      https://api.github.com/repos/Scyllarides-Latus/apt-repo/dispatches \
-      -d '{"event_type":"publish-deb","client_payload":{"project":"'"${GITHUB_REPOSITORY}"'","tag":"'"${GITHUB_REF_NAME}"'"}}'
+    gh api repos/Scyllarides-Latus/apt-repo/dispatches \
+      -f event_type=publish-deb \
+      -f "client_payload[project]=${GITHUB_REPOSITORY}" \
+      -f "client_payload[tag]=${TAG}"
 ```
 
-The `APT_REPO_PAT` needs `contents:write` permission on this repo.
+The `actions/create-github-app-token` action mints an ephemeral token (1hr) scoped to `apt-repo` only.
