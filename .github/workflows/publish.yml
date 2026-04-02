@@ -1,0 +1,111 @@
+name: Publish APT Repository
+
+on:
+  repository_dispatch:
+    types: [publish-deb]
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "Source repo (owner/name)"
+        required: true
+      tag:
+        description: "Release tag to download debs from"
+        required: true
+
+concurrency:
+  group: apt-repo-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve inputs
+        id: inputs
+        env:
+          DISPATCH_PROJECT: ${{ github.event.client_payload.project }}
+          DISPATCH_TAG: ${{ github.event.client_payload.tag }}
+          MANUAL_PROJECT: ${{ inputs.project }}
+          MANUAL_TAG: ${{ inputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "${EVENT_NAME}" = "repository_dispatch" ]; then
+            echo "project=${DISPATCH_PROJECT}" >> "$GITHUB_OUTPUT"
+            echo "tag=${DISPATCH_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "project=${MANUAL_PROJECT}" >> "$GITHUB_OUTPUT"
+            echo "tag=${MANUAL_TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download .deb files from source release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT: ${{ steps.inputs.outputs.project }}
+          TAG: ${{ steps.inputs.outputs.tag }}
+        run: |
+          mkdir -p debs
+          gh release download "${TAG}" \
+            --repo "${PROJECT}" \
+            --pattern "*.deb" \
+            --dir debs
+          echo "Downloaded debs:"
+          ls -lh debs/
+
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: Copy debs to pool
+        run: |
+          mkdir -p gh-pages/pool/main
+          cp debs/*.deb gh-pages/pool/main/
+
+      - name: Import GPG key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          echo "${GPG_PRIVATE_KEY}" | gpg --batch --import
+
+      - name: Rebuild package indices
+        run: |
+          cd gh-pages
+
+          for arch in arm64 armhf amd64; do
+            dir="dists/stable/main/binary-${arch}"
+            mkdir -p "${dir}"
+
+            dpkg-scanpackages --arch "${arch}" pool/main > "${dir}/Packages"
+            gzip -9c "${dir}/Packages" > "${dir}/Packages.gz"
+          done
+
+      - name: Generate and sign Release
+        run: |
+          cd gh-pages/dists/stable
+
+          apt-ftparchive release . > Release
+
+          GPG_KEY_ID=$(gpg --list-keys --with-colons | awk -F: '/^pub/{getline; print $10; exit}')
+
+          gpg --batch --yes --default-key "${GPG_KEY_ID}" \
+            --armor --detach-sign --output Release.gpg Release
+
+          gpg --batch --yes --default-key "${GPG_KEY_ID}" \
+            --armor --clearsign --output InRelease Release
+
+      - name: Commit and push
+        env:
+          PROJECT: ${{ steps.inputs.outputs.project }}
+          TAG: ${{ steps.inputs.outputs.tag }}
+        run: |
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Update packages from ${PROJECT}@${TAG}"
+          git push
